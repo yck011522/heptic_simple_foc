@@ -11,9 +11,9 @@ constexpr int kPhaseCPin = 25;
 constexpr int kEnablePin = 12;
 constexpr int kMotorPolePairs = 14;
 constexpr float kSupplyVoltage = 12.0f;
-constexpr float kVoltageLimit = 6.0f;
-constexpr float kSensorAlignVoltage = 3.0f;
-constexpr float kVelocityLimit = 20.0f;
+constexpr float kVoltageLimit = 10.0f; // Do not use 12V or the motor will feel clicky.
+constexpr float kSensorAlignVoltage = 6.0f; // Seems strong enough 
+constexpr float kVelocityLimit = 40.0f;
 }
 
 MagneticSensorI2C sensor(AS5600_I2C);

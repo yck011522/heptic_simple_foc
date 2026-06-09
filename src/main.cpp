@@ -54,13 +54,15 @@ void setup() {
 
   SimpleFOCDebug::enable(&Serial);
 
+  // This block is calibrated to reduce I2C bus error.
   Wire.begin(kI2cSdaPin, kI2cSclPin, kI2cClockHz);
   Wire.setClock(kI2cClockHz);
   Wire.setTimeOut(25);
-  sensor.min_elapsed_time = 5000; // 2000 microseconds ~ 500Hz update rate, which is sufficient for this application and reduces I2C bus load
+  sensor.min_elapsed_time = 2000; // 2000 microseconds ~ 500Hz update rate, which is sufficient for this application and reduces I2C bus load
   sensor.init(&Wire);
   motor.linkSensor(&sensor);
 
+  // This block is calibrated to reduce I2C bus error.
   driver.voltage_power_supply = kSupplyVoltage;
   driver.voltage_limit = kVoltageLimit;
   driver.pwm_frequency = 16000; // Lower from 20kHz to avoid polluting I2C bus, very helpful when speed is slow.
@@ -72,6 +74,7 @@ void setup() {
   motor.controller = MotionControlType::angle;
   motor.torque_controller = TorqueControlType::voltage;
 
+  // This block is rough calibrated for a meaningful angle tracking force
   motor.voltage_limit = kVoltageLimit;
   motor.voltage_sensor_align = kSensorAlignVoltage;
   motor.velocity_limit = kVelocityLimit;
@@ -82,7 +85,7 @@ void setup() {
   motor.LPF_velocity.Tf = 0.01f;
   motor.P_angle.P = 40.0f;
 
-
+  
   motor.useMonitoring(Serial);
   motor.monitor_downsample = 50;
 
