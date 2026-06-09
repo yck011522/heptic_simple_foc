@@ -22,7 +22,7 @@ from device_discovery import (
 
 
 DEFAULT_PLATFORMIO = Path.home() / ".platformio" / "penv" / "Scripts" / "platformio.exe"
-DEFAULT_FIRMWARE_VERSION = "0.3.0"
+DEFAULT_FIRMWARE_VERSION = "0.5.0"
 DEFAULT_MOTION_DETECT_WINDOW = 2.0
 DEFAULT_MOTION_THRESHOLD = 100
 

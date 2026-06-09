@@ -15,15 +15,17 @@ DEFAULT_BOOTSTRAP_MAX_DECIDEG = 3600
 DEFAULT_BOOTSTRAP_SEQ_START = 1000
 
 DEFAULT_BOOTSTRAP_PARAMS: tuple[tuple[str, int], ...] = (
-    ("tracking_kp", 6000),
-    ("tracking_kd", 2),
+    # Mirrors RuntimeParams defaults in src/main.cpp (wire units).
+    ("tracking_kp", 10000),
+    ("tracking_kd", 100),
     ("detent_kp", 5000),
-    ("bounds_kp", 10000),
-    ("tracking_max_torque", 6000),
-    ("bounds_max_torque", 300),
-    ("detent_max_torque", 200),
-    ("oob_kick_amplitude", 3000),
-    ("vibration_amplitude", 300),
+    ("bounds_kp", 20000),
+    ("tracking_max_torque", 5000),
+    ("bounds_max_torque", 1000),
+    ("detent_max_torque", 1000),
+    ("detent_distance", 10000),
+    ("oob_kick_amplitude", 2000),
+    ("vibration_amplitude", 1000),
     ("vibration_pulse_interval_ms", 1000),
     ("oob_kick_pulse_interval_ms", 40),
     ("enable_tracking", 1),
@@ -31,7 +33,7 @@ DEFAULT_BOOTSTRAP_PARAMS: tuple[tuple[str, int], ...] = (
     ("enable_oob_kick", 1),
     ("enable_detent", 0),
     ("enable_vibration", 0),
-    ("telemetry_interval", 20),
+    ("telemetry_interval", 10),
 )
 
 POST_UPLOAD_PORT_READY_TIMEOUT_S = 35.0
@@ -217,7 +219,7 @@ def bootstrap_uploaded_device(port: str, baud: int = BAUD) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Upload firmware to all connected controllers that match one exact VID/PID pair.")
     parser.add_argument("--platformio", default=str(DEFAULT_PLATFORMIO), help="Path to the PlatformIO executable")
-    parser.add_argument("--environment", default="lolin32_lite", help="PlatformIO environment name")
+    parser.add_argument("--environment", default="main", help="PlatformIO environment name")
     parser.add_argument("--baud", type=int, default=BAUD, help="Serial baud for post-upload initialization")
     parser.add_argument("--vid", type=lambda value: int(value, 0), default=0x1A86, help="USB VID to target")
     parser.add_argument("--pid", type=lambda value: int(value, 0), default=0x7523, help="USB PID to target")
