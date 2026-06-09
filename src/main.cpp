@@ -46,12 +46,12 @@ enum StatusBit : uint8_t {
 
 // Tunable runtime parameters exposed by S command and persisted in NVS.
 struct RuntimeParams {
-  float tracking_kp = 5.0f;          // Tracking proportional gain [torque/rad].
+  float tracking_kp = 10.0f;         // Tracking proportional gain [torque/rad].
   float tracking_kd = 0.1f;          // Tracking derivative gain [torque/(rad/s)].
-  float tracking_max_torque = 2.0f;  // Tracking torque clamp [V-equivalent].
+  float tracking_max_torque = 5.0f;  // Tracking torque clamp [V-equivalent].
 
   float bounds_kp = 20.0f;          // Bounds spring gain [torque/rad].
-  float bounds_max_torque = 3.0f;   // Bounds torque clamp [V-equivalent].
+  float bounds_max_torque = 1.0f;   // Bounds torque clamp [V-equivalent].
 
   float detent_kp = 5.0f;                           // Stored detent gain (currently not applied).
   float detent_distance_rad = 10.0f * PI / 180.0f; // Stored detent spacing [rad].
@@ -60,7 +60,7 @@ struct RuntimeParams {
   float vibration_amplitude = 1.0f;              // Stored vibration amplitude (not applied).
   uint16_t vibration_pulse_interval_ms = 1000;   // Stored vibration period [ms].
 
-  float oob_kick_amplitude = 1.0f;             // OOB kick amplitude [V-equivalent].
+  float oob_kick_amplitude = 2.0f;             // OOB kick amplitude [V-equivalent].
   uint16_t oob_kick_pulse_interval_ms = 40;    // OOB pulse toggle period [ms].
 
   bool enable_tracking = true;            // status_bits bit0 default ON.
@@ -360,7 +360,7 @@ bool handleSParam(const char* param_name, bool is_set, long set_value, long& res
     return true;
   }
   if (strcmp(param_name, "oob_kick_amplitude") == 0) {
-    if (is_set) g_params.oob_kick_amplitude = static_cast<float>(set_value) / 1000.0f;
+    if (is_set) g_params.oob_kick_amplitude = fabsf(static_cast<float>(set_value) / 1000.0f);
     response_value = lroundf(g_params.oob_kick_amplitude * 1000.0f);
     return true;
   }
@@ -663,8 +663,15 @@ float computeCommandedTorque(float logical_angle_rad, float velocity_rad_s, unsi
     }
 
     if (g_state.oob_pulse_on) {
+      // OOB kick is implemented as an inward-torque ripple that reduces
+      // the current restorative torque magnitude without flipping direction.
+      // Positive wire amplitude therefore means "reduce inward torque by X".
       const float inward_direction = (logical_angle_rad < g_state.bound_min_rad) ? 1.0f : -1.0f;
-      torque_sum += inward_direction * g_params.oob_kick_amplitude;
+      const float inward_component = torque_sum * inward_direction;
+      if (inward_component > 0.0f) {
+        const float reduction = fminf(g_params.oob_kick_amplitude, inward_component);
+        torque_sum -= inward_direction * reduction;
+      }
     }
   } else {
     g_state.oob_pulse_on = false;

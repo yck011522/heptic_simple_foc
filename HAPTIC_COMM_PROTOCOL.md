@@ -194,17 +194,17 @@ Supported parameter names:
 
 | Parameter name | Unit on wire | Description | Default / target |
 |----------------|--------------|-------------|------------------|
-| `tracking_kp` | x1000 | Target Position Tracking proportional gain | `5.0` |
+| `tracking_kp` | x1000 | Target Position Tracking proportional gain | `10.0` |
 | `tracking_kd` | x1000 | Target Position Tracking derivative gain | `0.1` |
-| `tracking_max_torque` | x1000 | Target Position Tracking Max tracking torque in A | `2.0` |
+| `tracking_max_torque` | x1000 | Target Position Tracking Max tracking torque in A | `5.0` |
 | `bounds_kp` | x1000 | Bounds Restoration Force gain | `20.0` |
-| `bounds_max_torque` | x1000 | Max Bounds Restoration torque in A | `3.0` |
+| `bounds_max_torque` | x1000 | Max Bounds Restoration torque in A | `1.0` |
 | `detent_kp` | x1000 | Digital Detent spring gain | `5.0` |
 | `detent_distance` | x1000 decideg | Digital Detent spacing | about `10 deg` |
 | `detent_max_torque` | x1000 | Digital Detent Max torque in A | `1.0` |
 | `vibration_amplitude` | x1000 | Vibration pulse amplitude in A (OBSOLETE / No Impl)| `1.0` |
 | `vibration_pulse_interval_ms` | ms | Vibration pulse interval (OBSOLETE / No Impl)| `1000` ms |
-| `oob_kick_amplitude` | x1000 | OUT-OF-BOUND kick amplitude in A | `1.0` |
+| `oob_kick_amplitude` | x1000 | OUT-OF-BOUND kick amplitude in A | `2.0` |
 | `oob_kick_pulse_interval_ms` | ms | OUT-OF-BOUND kick pulse interval | `40` ms |
 | `enable_tracking` | `0` or `1` | Enable Target Position Tracking | enabled |
 | `enable_bounds_restoration` | `0` or `1` | Enable Bounds Restoration Force | enabled |
