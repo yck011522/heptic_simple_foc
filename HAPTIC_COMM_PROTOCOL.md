@@ -39,7 +39,7 @@ The firmware does not need protocol backward compatibility with the earlier two-
 
 | Parameter | Value |
 |-----------|-------|
-| Baud rate | 230400 |
+| Baud rate | 115200 |
 | Data bits | 8 |
 | Parity | None |
 | Stop bits | 1 |

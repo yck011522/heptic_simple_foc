@@ -1,3 +1,9 @@
+"""Automated communication-protocol and performance validation for one controller.
+
+This script can optionally flash firmware, then validate command/telemetry behavior
+against HAPTIC_COMM_PROTOCOL.md using a live serial session.
+"""
+
 import argparse
 import subprocess
 import sys
@@ -8,7 +14,7 @@ from pathlib import Path
 import serial
 
 
-BAUD = 230400
+BAUD = 115200
 DEFAULT_PORT = "COM5"
 DEFAULT_ENV = "main"
 DEFAULT_FOC_MIN_HZ = 800
@@ -20,6 +26,8 @@ PLATFORMIO_EXE = Path.home() / ".platformio" / "penv" / "Scripts" / "platformio.
 
 @dataclass
 class Telemetry:
+    """Typed representation of one parsed telemetry frame."""
+
     dial_id: int
     seq: int
     ang_decideg: int
@@ -30,11 +38,15 @@ class Telemetry:
 
 
 class ProtocolTestError(RuntimeError):
+    """Raised when a protocol requirement is violated during testing."""
+
     pass
 
 
 @dataclass
 class TestStats:
+    """Aggregated line-parse statistics for observability and quality gates."""
+
     malformed_telemetry_lines: int = 0
     valid_telemetry_lines: int = 0
     malformed_samples: list[str] | None = None
@@ -45,6 +57,8 @@ class TestStats:
 
 
 def parse_telemetry(line: str) -> Telemetry:
+    """Parse one telemetry line and enforce strict integer CSV shape."""
+
     parts = line.strip().split(",")
     if len(parts) != 8 or parts[0] != "T":
         raise ProtocolTestError(f"Invalid telemetry line shape: {line!r}")
@@ -64,10 +78,18 @@ def parse_telemetry(line: str) -> Telemetry:
 
 
 def bit_is_set(value: int, bit: int) -> bool:
+    """Return True when a specific status bit is enabled."""
+
     return ((value >> bit) & 1) == 1
 
 
 def read_line(ser: serial.Serial, timeout_s: float) -> str:
+    """Read one complete newline-terminated serial line.
+
+    Keeps a per-serial-object buffer so partial chunks from non-blocking reads
+    are retained and merged correctly across calls.
+    """
+
     if not hasattr(read_line, "_buffers"):
         read_line._buffers = {}
 
@@ -94,6 +116,8 @@ def read_line(ser: serial.Serial, timeout_s: float) -> str:
 
 
 def wait_for_prefix(ser: serial.Serial, prefix: str, timeout_s: float) -> str:
+    """Wait until a serial line starts with the requested prefix."""
+
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         line = read_line(ser, timeout_s=max(0.01, deadline - time.monotonic()))
@@ -103,6 +127,8 @@ def wait_for_prefix(ser: serial.Serial, prefix: str, timeout_s: float) -> str:
 
 
 def wait_for_telemetry(ser: serial.Serial, timeout_s: float, stats: TestStats | None = None) -> Telemetry:
+    """Wait for a valid telemetry frame, skipping malformed frames if needed."""
+
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -123,6 +149,8 @@ def wait_for_telemetry(ser: serial.Serial, timeout_s: float, stats: TestStats | 
 
 
 def wait_for_telemetry_seq(ser: serial.Serial, seq: int, timeout_s: float, stats: TestStats | None = None) -> Telemetry:
+    """Wait for telemetry whose echoed C sequence equals seq."""
+
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         t = wait_for_telemetry(ser, timeout_s=max(0.01, deadline - time.monotonic()), stats=stats)
@@ -132,16 +160,22 @@ def wait_for_telemetry_seq(ser: serial.Serial, seq: int, timeout_s: float, stats
 
 
 def send_cmd(ser: serial.Serial, command: str) -> None:
+    """Send one protocol command line with newline terminator."""
+
     ser.write((command + "\n").encode())
     ser.flush()
 
 
 def send_cmd_expect_prefix(ser: serial.Serial, command: str, prefix: str, timeout_s: float = 1.0) -> str:
+    """Send a command and wait for a matching response prefix."""
+
     send_cmd(ser, command)
     return wait_for_prefix(ser, prefix, timeout_s=timeout_s)
 
 
 def flash_firmware(port: str, env_name: str) -> None:
+    """Flash firmware using PlatformIO upload target for the selected port."""
+
     if not PLATFORMIO_EXE.exists():
         raise ProtocolTestError(f"PlatformIO executable not found: {PLATFORMIO_EXE}")
 
@@ -165,6 +199,8 @@ def flash_firmware(port: str, env_name: str) -> None:
 
 
 def open_and_wait_streaming_telemetry(port: str, baud: int, timeout_s: float) -> tuple[serial.Serial, Telemetry]:
+    """Open serial port and wait for telemetry after reboot/reconnect."""
+
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
 
@@ -186,6 +222,8 @@ def open_and_wait_streaming_telemetry(port: str, baud: int, timeout_s: float) ->
 
 
 def wait_for_valid_telemetry_after_noise(ser: serial.Serial, timeout_s: float, stats: TestStats | None = None) -> Telemetry:
+    """Recover to a valid telemetry frame after potential non-telemetry output."""
+
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -206,6 +244,12 @@ def wait_for_valid_telemetry_after_noise(ser: serial.Serial, timeout_s: float, s
 
 
 def validate_protocol_and_performance(ser: serial.Serial, foc_min_hz: int, exercise_m: bool, stats: TestStats) -> None:
+    """Run protocol compliance and basic dynamics/performance checks.
+
+    Checks include response format, C/R behavior, status bit semantics,
+    telemetry limits, and average FOC loop rate.
+    """
+
     seq = 100
 
     print("[STEP] Checking V/I/E command acks")
@@ -278,14 +322,14 @@ def validate_protocol_and_performance(ser: serial.Serial, foc_min_hz: int, exerc
     angles_pos = []
     start = time.monotonic()
     while time.monotonic() - start < 0.6:
-                angles_pos.append(wait_for_telemetry(ser, timeout_s=0.2, stats=stats).ang_decideg)
+        angles_pos.append(wait_for_telemetry(ser, timeout_s=0.2, stats=stats).ang_decideg)
 
     send_cmd(ser, f"C,{seq},-900,-108000,108000")
     seq += 1
     angles_neg = []
     start = time.monotonic()
     while time.monotonic() - start < 0.6:
-                angles_neg.append(wait_for_telemetry(ser, timeout_s=0.2, stats=stats).ang_decideg)
+        angles_neg.append(wait_for_telemetry(ser, timeout_s=0.2, stats=stats).ang_decideg)
 
     if not angles_pos or not angles_neg:
         raise ProtocolTestError("Insufficient telemetry samples for motion check")
@@ -326,6 +370,8 @@ def validate_protocol_and_performance(ser: serial.Serial, foc_min_hz: int, exerc
 
 
 def main() -> int:
+    """CLI entrypoint: optionally flash, then run protocol tests over serial."""
+
     parser = argparse.ArgumentParser(description="Flash and validate haptic controller against COMM protocol")
     parser.add_argument("--port", default=DEFAULT_PORT)
     parser.add_argument("--baud", type=int, default=BAUD)
@@ -363,4 +409,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Exit code is used by CI/task runners.
     raise SystemExit(main())

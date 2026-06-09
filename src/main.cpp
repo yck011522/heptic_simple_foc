@@ -5,30 +5,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Firmware architecture notes:
+// 1) All protocol wire values are integer CSV fields.
+// 2) Control math is run in normal units (rad, rad/s, voltage-mode torque command).
+// 3) Unit conversion happens only at parser/telemetry boundaries.
 namespace {
-constexpr int kI2cSdaPin = 19;
-constexpr int kI2cSclPin = 18;
-constexpr uint32_t kI2cClockHz = 400000;
-constexpr int kPhaseAPin = 32;
-constexpr int kPhaseBPin = 33;
-constexpr int kPhaseCPin = 25;
-constexpr int kEnablePin = 12;
-constexpr int kMotorPolePairs = 14;
-constexpr float kSupplyVoltage = 12.0f;
+constexpr int kI2cSdaPin = 19;          // I2C SDA GPIO used by AS5600 sensor.
+constexpr int kI2cSclPin = 18;          // I2C SCL GPIO used by AS5600 sensor.
+constexpr uint32_t kI2cClockHz = 400000; // Sensor bus speed (400kHz, calibrated stable).
+constexpr int kPhaseAPin = 32;          // Driver phase A PWM pin.
+constexpr int kPhaseBPin = 33;          // Driver phase B PWM pin.
+constexpr int kPhaseCPin = 25;          // Driver phase C PWM pin.
+constexpr int kEnablePin = 12;          // Driver enable pin.
+constexpr int kMotorPolePairs = 14;     // Motor electrical pole-pair count.
+constexpr float kSupplyVoltage = 12.0f; // Physical driver supply rail voltage (V).
 constexpr float kVoltageLimit = 10.0f; // Do not use 12V or the motor will feel clicky.
-constexpr float kSensorAlignVoltage = 6.0f; // Seems strong enough
-constexpr float kVelocityLimit = 40.0f;
+constexpr float kSensorAlignVoltage = 6.0f; // Sensor alignment voltage (V) used by initFOC().
+constexpr float kVelocityLimit = 40.0f; // Motor velocity limit used by internal SimpleFOC guards.
 
-constexpr uint32_t kSerialBaud = 230400;
-constexpr uint16_t kDefaultTelemetryIntervalMs = 10;
-constexpr uint32_t kFocRateWindowMs = 200;
-constexpr uint32_t kFaultHoldMs = 500;
+constexpr uint32_t kSerialBaud = 115200; // Protocol UART baud rate.
+constexpr uint16_t kDefaultTelemetryIntervalMs = 10; // Default telemetry period (ms).
+constexpr uint32_t kFocRateWindowMs = 200; // Rolling window (ms) for FOC loop-rate estimate.
+constexpr uint32_t kFaultHoldMs = 500; // Protocol fault latch duration (ms).
 constexpr size_t kMaxProtocolLineLength = 127; // Excluding newline.
-constexpr float kRadPerDecideg = PI / 1800.0f;
-constexpr float kDecidegPerRad = 1800.0f / PI;
-constexpr char kFirmwareVersion[] = "0.5.0";
+constexpr float kRadPerDecideg = PI / 1800.0f; // Wire angle conversion factor.
+constexpr float kDecidegPerRad = 1800.0f / PI; // Inverse wire angle conversion factor.
+constexpr char kFirmwareVersion[] = "0.5.0"; // V command reported firmware version.
 }
 
+// status_bits layout sent in telemetry (T line field #8).
 enum StatusBit : uint8_t {
   kStatusTrackingEnabled = 0,
   kStatusBoundsEnabled = 1,
@@ -39,72 +44,75 @@ enum StatusBit : uint8_t {
   kStatusFaultActive = 6,
 };
 
+// Tunable runtime parameters exposed by S command and persisted in NVS.
 struct RuntimeParams {
-  float tracking_kp = 5.0f;
-  float tracking_kd = 0.1f;
-  float tracking_max_torque = 2.0f;
+  float tracking_kp = 5.0f;          // Tracking proportional gain [torque/rad].
+  float tracking_kd = 0.1f;          // Tracking derivative gain [torque/(rad/s)].
+  float tracking_max_torque = 2.0f;  // Tracking torque clamp [V-equivalent].
 
-  float bounds_kp = 20.0f;
-  float bounds_max_torque = 3.0f;
+  float bounds_kp = 20.0f;          // Bounds spring gain [torque/rad].
+  float bounds_max_torque = 3.0f;   // Bounds torque clamp [V-equivalent].
 
-  float detent_kp = 5.0f;
-  float detent_distance_rad = 10.0f * PI / 180.0f;
-  float detent_max_torque = 1.0f;
+  float detent_kp = 5.0f;                           // Stored detent gain (currently not applied).
+  float detent_distance_rad = 10.0f * PI / 180.0f; // Stored detent spacing [rad].
+  float detent_max_torque = 1.0f;                  // Stored detent torque clamp.
 
-  float vibration_amplitude = 1.0f;
-  uint16_t vibration_pulse_interval_ms = 1000;
+  float vibration_amplitude = 1.0f;              // Stored vibration amplitude (not applied).
+  uint16_t vibration_pulse_interval_ms = 1000;   // Stored vibration period [ms].
 
-  float oob_kick_amplitude = 1.0f;
-  uint16_t oob_kick_pulse_interval_ms = 40;
+  float oob_kick_amplitude = 1.0f;             // OOB kick amplitude [V-equivalent].
+  uint16_t oob_kick_pulse_interval_ms = 40;    // OOB pulse toggle period [ms].
 
-  bool enable_tracking = true;
-  bool enable_bounds_restoration = true;
-  bool enable_oob_kick = true;
-  bool enable_detent = false;
-  bool enable_vibration = false;
+  bool enable_tracking = true;            // status_bits bit0 default ON.
+  bool enable_bounds_restoration = true;  // status_bits bit1 default ON.
+  bool enable_oob_kick = true;            // status_bits bit2 default ON.
+  bool enable_detent = false;             // status_bits bit3 default OFF.
+  bool enable_vibration = false;          // status_bits bit4 default OFF.
 
-  uint16_t telemetry_interval_ms = kDefaultTelemetryIntervalMs;
+  uint16_t telemetry_interval_ms = kDefaultTelemetryIntervalMs; // Telemetry period [ms].
 };
 
+// Live control and telemetry state updated each loop iteration.
 struct ControlState {
-  uint8_t dial_id = 0;
-  uint32_t last_c_seq = 0;
+  uint8_t dial_id = 0;      // Persistent dial identity; 0 means unconfigured.
+  uint32_t last_c_seq = 0;  // Last accepted C command sequence.
 
-  float target_angle_rad = 0.0f;
-  float bound_min_rad = -5.0f;
-  float bound_max_rad = 5.0f;
+  float target_angle_rad = 0.0f; // Latest target angle from C command [rad].
+  float bound_min_rad = -5.0f;   // Active soft lower bound [rad].
+  float bound_max_rad = 5.0f;    // Active soft upper bound [rad].
 
-  float logical_angle_offset_rad = 0.0f;
-  float filtered_velocity_rad_s = 0.0f;
+  float logical_angle_offset_rad = 0.0f; // Logical frame offset applied to raw sensor angle.
+  float filtered_velocity_rad_s = 0.0f;  // Low-pass filtered shaft velocity [rad/s].
 
-  float last_torque_command = 0.0f;
-  bool oob_pulse_on = false;
-  unsigned long last_oob_pulse_ms = 0;
+  float last_torque_command = 0.0f;    // Last commanded torque value sent to motor.move().
+  bool oob_pulse_on = false;           // Current OOB pulse phase state.
+  unsigned long last_oob_pulse_ms = 0; // Last OOB pulse phase toggle timestamp.
 
-  bool out_of_bounds = false;
-  long foc_control_rate_hz = 0;
-  uint32_t status_bits = 0;
+  bool out_of_bounds = false;      // True when logical angle is outside current bounds.
+  long foc_control_rate_hz = 0;    // Estimated loop frequency from rolling window.
+  uint32_t status_bits = 0;        // Packed status bits emitted in telemetry.
 };
 
-MagneticSensorI2C sensor(AS5600_I2C);
-BLDCMotor motor(kMotorPolePairs);
-BLDCDriver3PWM driver(kPhaseAPin, kPhaseBPin, kPhaseCPin, kEnablePin);
-Preferences preferences;
-Commander commander(Serial);
+MagneticSensorI2C sensor(AS5600_I2C); // AS5600 magnetic angle sensor interface.
+BLDCMotor motor(kMotorPolePairs); // SimpleFOC motor object.
+BLDCDriver3PWM driver(kPhaseAPin, kPhaseBPin, kPhaseCPin, kEnablePin); // 3PWM gate-driver interface.
+Preferences preferences; // ESP32 NVS-backed key/value storage.
+Commander commander(Serial); // SimpleFOC command parser used for M command compatibility.
 
-RuntimeParams g_params;
-ControlState g_state;
+RuntimeParams g_params; // Live + persisted S-parameter set.
+ControlState g_state; // Live control/telemetry working state.
 
-unsigned long g_last_telemetry_ms = 0;
-unsigned long g_fault_until_ms = 0;
-unsigned long g_last_foc_window_ms = 0;
-unsigned int g_foc_window_count = 0;
-unsigned long g_last_control_micros = 0;
+unsigned long g_last_telemetry_ms = 0;  // Last emitted telemetry timestamp.
+unsigned long g_fault_until_ms = 0;     // Fault latch expiry timestamp.
+unsigned long g_last_foc_window_ms = 0; // Start time for current FOC-rate window.
+unsigned int g_foc_window_count = 0;    // loop() iterations accumulated in the current window.
+unsigned long g_last_control_micros = 0; // Previous loop timestamp for dt calculation.
 
-char g_line_buffer[kMaxProtocolLineLength + 1] = {0};
-size_t g_line_len = 0;
-bool g_line_overflow = false;
+char g_line_buffer[kMaxProtocolLineLength + 1] = {0}; // Incoming protocol line assembly buffer.
+size_t g_line_len = 0; // Current fill length in g_line_buffer.
+bool g_line_overflow = false; // True once an overlength line is detected before newline.
 
+// Generic clamp helper for numeric safety across protocol and control paths.
 template <typename T>
 T clampValue(T value, T min_value, T max_value) {
   if (value < min_value) {
@@ -116,23 +124,28 @@ T clampValue(T value, T min_value, T max_value) {
   return value;
 }
 
+// Convert wire angle (decideg) to radians for internal control logic.
 float decidegToRad(long decideg) {
   return static_cast<float>(decideg) * kRadPerDecideg;
 }
 
+// Convert internal angle (rad) to wire angle (decideg).
 long radToDecideg(float rad) {
   return lroundf(rad * kDecidegPerRad);
 }
 
+// Convert internal speed (rad/s) to wire speed (decideg/s).
 long radPerSecToDecidegPerSec(float rad_per_sec) {
   return lroundf(rad_per_sec * kDecidegPerRad);
 }
 
+// Convert voltage-mode torque command to wire telemetry units (millivolt-equivalent).
 long torqueToMilliVolt(float torque_command) {
   const long raw_mv = lroundf(torque_command * 1000.0f);
   return clampValue<long>(raw_mv, -10000, 10000);
 }
 
+// Parse strict integer field used by protocol wire format.
 bool parseLong(const char* input, long& out) {
   if (input == nullptr || *input == '\0') {
     return false;
@@ -146,6 +159,7 @@ bool parseLong(const char* input, long& out) {
   return true;
 }
 
+// Parse sequence field as uint32-compatible integer.
 bool parseUInt32(const char* input, uint32_t& out) {
   if (input == nullptr || *input == '\0') {
     return false;
@@ -159,18 +173,22 @@ bool parseUInt32(const char* input, uint32_t& out) {
   return true;
 }
 
+// Latch a temporary protocol-fault window visible through status bit 6.
 void latchProtocolFault() {
   g_fault_until_ms = millis() + kFaultHoldMs;
 }
 
+// Clear the fault latch after successfully processed frames.
 void clearProtocolFault() {
   g_fault_until_ms = 0;
 }
 
+// Persist dial identity in NVS.
 void persistDialId() {
   preferences.putUChar("dial_id", g_state.dial_id);
 }
 
+// Persist all runtime S parameters in NVS.
 void persistParams() {
   preferences.putFloat("trk_kp", g_params.tracking_kp);
   preferences.putFloat("trk_kd", g_params.tracking_kd);
@@ -198,6 +216,7 @@ void persistParams() {
   preferences.putUShort("tele_ms", g_params.telemetry_interval_ms);
 }
 
+// Load persisted identity and runtime parameters from NVS with defaults.
 void loadPersistentState() {
   g_state.dial_id = preferences.getUChar("dial_id", g_state.dial_id);
 
@@ -228,10 +247,12 @@ void loadPersistentState() {
   g_params.telemetry_interval_ms = clampValue<uint16_t>(g_params.telemetry_interval_ms, 1, 200);
 }
 
+// Commander callback for direct SimpleFOC M command support.
 void onMotor(char* cmd) {
   commander.motor(&motor, cmd);
 }
 
+// Rebuild status_bits field from enable flags and fault/out-of-bounds state.
 void updateStatusBits() {
   uint32_t bits = 0;
   if (g_params.enable_tracking) {
@@ -258,6 +279,7 @@ void updateStatusBits() {
   g_state.status_bits = bits;
 }
 
+// Emit one telemetry frame using strict protocol integer fields.
 void sendTelemetry(float logical_angle_rad) {
   updateStatusBits();
   const long angle_decideg = radToDecideg(logical_angle_rad);
@@ -280,6 +302,7 @@ void sendTelemetry(float logical_angle_rad) {
   Serial.println(g_state.status_bits);
 }
 
+// Handle S parameter read/write and return response value if known.
 bool handleSParam(const char* param_name, bool is_set, long set_value, long& response_value, bool& known_param) {
   known_param = true;
 
@@ -381,6 +404,8 @@ bool handleSParam(const char* param_name, bool is_set, long set_value, long& res
   return true;
 }
 
+// Parse and execute one fully assembled protocol line.
+// Supported commands: C, R, S, I, V, E, and non-CSV M passthrough.
 void handleProtocolLine(char* line) {
   if (line[0] == '\0') {
     return;
@@ -562,6 +587,8 @@ void handleProtocolLine(char* line) {
   }
 }
 
+// Read serial bytes, assemble newline-terminated lines, enforce max line length,
+// and dispatch complete frames to handleProtocolLine().
 void serviceSerialInput() {
   while (Serial.available()) {
     const int read_value = Serial.read();
@@ -599,6 +626,8 @@ void serviceSerialInput() {
   }
 }
 
+// Compute composite torque from enabled haptic effects.
+// Internally uses normal units and clamps final command to safe voltage limit.
 float computeCommandedTorque(float logical_angle_rad, float velocity_rad_s, unsigned long now_ms) {
   g_state.out_of_bounds = (logical_angle_rad < g_state.bound_min_rad) || (logical_angle_rad > g_state.bound_max_rad);
 
@@ -644,6 +673,7 @@ float computeCommandedTorque(float logical_angle_rad, float velocity_rad_s, unsi
   return clampValue<float>(torque_sum, -kVoltageLimit, kVoltageLimit);
 }
 
+// Initialize serial, persistent settings, sensor/driver/motor, and protocol state.
 void setup() {
   Serial.begin(kSerialBaud);
   delay(1000);
@@ -695,6 +725,11 @@ void setup() {
   g_state.last_oob_pulse_ms = millis();
 }
 
+// Real-time control loop:
+// 1) Run FOC core.
+// 2) Update filtered state and compute torque command.
+// 3) Process serial protocol frames.
+// 4) Update performance metrics and periodic telemetry.
 void loop() {
   motor.loopFOC();
 

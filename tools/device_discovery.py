@@ -25,7 +25,7 @@ import serial
 import serial.tools.list_ports
 import time
 
-BAUD = 230400
+BAUD = 115200
 PROBE_TIMEOUT = 1.5  # seconds to wait for a response per command
 DRAIN_DELAY = 0.2  # seconds to wait after opening port to let telemetry flow
 
