@@ -481,9 +481,11 @@ void handleProtocolLine(char* line) {
       g_state.oob_pulse_on = false;
       g_state.last_oob_pulse_ms = millis();
 
-      if (g_state.last_c_seq <= seq) {
-        g_state.target_angle_rad = requested_logical_rad;
-      }
+      // Keep R behavior yank-free: after rebasing logical coordinates,
+      // immediately align tracking target to the same logical position.
+      // This avoids physical motion even when host sequence spaces for
+      // C and R are not strictly monotonic relative to each other.
+      g_state.target_angle_rad = requested_logical_rad;
 
       Serial.print("R,");
       Serial.println(seq);
