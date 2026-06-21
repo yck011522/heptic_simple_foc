@@ -19,6 +19,8 @@ DEFAULT_PORT = "COM5"
 DEFAULT_ENV = "main"
 DEFAULT_FOC_MIN_HZ = 800
 DEFAULT_TELEMETRY_MS = 10
+STATUS_SENSOR_FAULT = 7
+STATUS_SENSOR_RECOVERING = 8
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PLATFORMIO_EXE = Path.home() / ".platformio" / "penv" / "Scripts" / "platformio.exe"
@@ -349,6 +351,10 @@ def validate_protocol_and_performance(ser: serial.Serial, foc_min_hz: int, exerc
         rates.append(t.foc_rate_hz)
         if abs(t.tor_milli) > 10000:
             raise ProtocolTestError(f"Torque telemetry exceeded clamp range: {t.tor_milli}")
+        if bit_is_set(t.status_bits, STATUS_SENSOR_FAULT):
+            raise ProtocolTestError("Magnetic sensor fault became active during nominal telemetry validation")
+        if bit_is_set(t.status_bits, STATUS_SENSOR_RECOVERING):
+            raise ProtocolTestError("Magnetic sensor recovery became active during nominal telemetry validation")
 
     avg_rate = sum(rates) / len(rates)
     if avg_rate < foc_min_hz:

@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ReliableMagneticSensorI2C.h"
+
 // Firmware architecture notes:
 // 1) All protocol wire values are integer CSV fields.
 // 2) Control math is run in normal units (rad, rad/s, voltage-mode torque command).
@@ -27,6 +29,11 @@ constexpr uint32_t kSerialBaud = 115200; // Protocol UART baud rate.
 constexpr uint16_t kDefaultTelemetryIntervalMs = 10; // Default telemetry period (ms).
 constexpr uint32_t kFocRateWindowMs = 200; // Rolling window (ms) for FOC loop-rate estimate.
 constexpr uint32_t kFaultHoldMs = 500; // Protocol fault latch duration (ms).
+constexpr uint16_t kSensorFailureThreshold = 8; // Consecutive failed reads required to disable torque.
+constexpr uint16_t kSensorRecoverySuccessThreshold = 8; // Consecutive valid reads required to restore torque.
+constexpr uint32_t kSensorRecoveryCooldownMs = 30000; // Minimum delay between I2C recovery attempts (ms).
+constexpr uint8_t kI2cRecoveryClockPulses = 16; // SCL pulses used to release a slave stuck mid-transfer.
+constexpr uint16_t kI2cRecoveryPulseUs = 5; // Half-period of recovery clock pulses (us).
 constexpr size_t kMaxProtocolLineLength = 127; // Excluding newline.
 constexpr float kRadPerDecideg = PI / 1800.0f; // Wire angle conversion factor.
 constexpr float kDecidegPerRad = 1800.0f / PI; // Inverse wire angle conversion factor.
@@ -42,6 +49,8 @@ enum StatusBit : uint8_t {
   kStatusVibrationEnabled = 4,
   kStatusOutOfBounds = 5,
   kStatusFaultActive = 6,
+  kStatusSensorFault = 7,
+  kStatusSensorRecovering = 8,
 };
 
 // Tunable runtime parameters exposed by S command and persisted in NVS.
@@ -91,9 +100,14 @@ struct ControlState {
   bool out_of_bounds = false;      // True when logical angle is outside current bounds.
   long foc_control_rate_hz = 0;    // Estimated loop frequency from rolling window.
   uint32_t status_bits = 0;        // Packed status bits emitted in telemetry.
+
+  uint16_t consecutive_sensor_errors = 0; // Failed AS5600 reads observed without an intervening success.
+  uint16_t consecutive_sensor_successes = 0; // Valid AS5600 reads observed while recovering.
+  bool sensor_fault_active = false; // True while torque is disabled because sensor reads are unreliable.
+  bool sensor_recovery_active = false; // True after a recovery attempt while valid reads are being confirmed.
 };
 
-MagneticSensorI2C sensor(AS5600_I2C); // AS5600 magnetic angle sensor interface.
+ReliableMagneticSensorI2C sensor; // AS5600 interface that rejects failed I2C reads.
 BLDCMotor motor(kMotorPolePairs); // SimpleFOC motor object.
 BLDCDriver3PWM driver(kPhaseAPin, kPhaseBPin, kPhaseCPin, kEnablePin); // 3PWM gate-driver interface.
 Preferences preferences; // ESP32 NVS-backed key/value storage.
@@ -107,6 +121,8 @@ unsigned long g_fault_until_ms = 0;     // Fault latch expiry timestamp.
 unsigned long g_last_foc_window_ms = 0; // Start time for current FOC-rate window.
 unsigned int g_foc_window_count = 0;    // loop() iterations accumulated in the current window.
 unsigned long g_last_control_micros = 0; // Previous loop timestamp for dt calculation.
+unsigned long g_last_sensor_recovery_ms = 0; // Timestamp of the most recent I2C recovery attempt.
+bool g_sensor_recovery_attempted = false; // True after the first recovery attempt, enabling cooldown enforcement.
 
 char g_line_buffer[kMaxProtocolLineLength + 1] = {0}; // Incoming protocol line assembly buffer.
 size_t g_line_len = 0; // Current fill length in g_line_buffer.
@@ -275,6 +291,13 @@ void updateStatusBits() {
   }
   if (millis() < g_fault_until_ms) {
     bits |= (1UL << kStatusFaultActive);
+  }
+  if (g_state.sensor_fault_active) {
+    bits |= (1UL << kStatusFaultActive);
+    bits |= (1UL << kStatusSensorFault);
+  }
+  if (g_state.sensor_recovery_active) {
+    bits |= (1UL << kStatusSensorRecovering);
   }
   g_state.status_bits = bits;
 }
@@ -682,6 +705,95 @@ float computeCommandedTorque(float logical_angle_rad, float velocity_rad_s, unsi
   return clampValue<float>(torque_sum, -kVoltageLimit, kVoltageLimit);
 }
 
+// Release one I2C line so its external pull-up can drive the bus high safely.
+void releaseI2cLine(int pin) {
+  pinMode(pin, INPUT_PULLUP);
+}
+
+// Drive one I2C line low without ever actively driving it high against a slave.
+void driveI2cLineLow(int pin) {
+  pinMode(pin, OUTPUT_OPEN_DRAIN);
+  digitalWrite(pin, LOW);
+}
+
+// Clock and stop the I2C bus to release an AS5600 left in a partial transaction.
+void clearI2cBus() {
+  releaseI2cLine(kI2cSdaPin);
+  releaseI2cLine(kI2cSclPin);
+  delayMicroseconds(kI2cRecoveryPulseUs);
+
+  for (uint8_t pulse = 0; pulse < kI2cRecoveryClockPulses; pulse++) {
+    driveI2cLineLow(kI2cSclPin);
+    delayMicroseconds(kI2cRecoveryPulseUs);
+    releaseI2cLine(kI2cSclPin);
+    delayMicroseconds(kI2cRecoveryPulseUs);
+  }
+
+  driveI2cLineLow(kI2cSdaPin);
+  delayMicroseconds(kI2cRecoveryPulseUs);
+  releaseI2cLine(kI2cSclPin);
+  delayMicroseconds(kI2cRecoveryPulseUs);
+  releaseI2cLine(kI2cSdaPin);
+  delayMicroseconds(kI2cRecoveryPulseUs);
+}
+
+// Restart the ESP32 I2C controller after clearing the physical bus.
+void restartI2cBus(unsigned long now_ms) {
+  driver.disable();
+  Wire.end();
+  clearI2cBus();
+  Wire.begin(kI2cSdaPin, kI2cSclPin, kI2cClockHz);
+  Wire.setClock(kI2cClockHz);
+  Wire.setTimeOut(25);
+
+  g_last_sensor_recovery_ms = now_ms;
+  g_sensor_recovery_attempted = true;
+  g_state.sensor_recovery_active = true;
+  g_state.consecutive_sensor_successes = 0;
+}
+
+// Monitor AS5600 transactions, disable unsafe torque, and coordinate recovery.
+void serviceSensorHealth(unsigned long now_ms) {
+  const bool read_succeeded = (sensor.currWireError == 0); // Result of loopFOC()'s latest AS5600 read.
+
+  if (read_succeeded) {
+    g_state.consecutive_sensor_errors = 0;
+    if (!g_state.sensor_fault_active) {
+      return;
+    }
+
+    if (g_state.consecutive_sensor_successes < kSensorRecoverySuccessThreshold) {
+      g_state.consecutive_sensor_successes++;
+    }
+    if (g_state.consecutive_sensor_successes >= kSensorRecoverySuccessThreshold) {
+      g_state.sensor_fault_active = false;
+      g_state.sensor_recovery_active = false;
+      g_state.consecutive_sensor_successes = 0;
+      driver.enable();
+    }
+    return;
+  }
+
+  g_state.consecutive_sensor_successes = 0;
+  if (g_state.consecutive_sensor_errors < kSensorFailureThreshold) {
+    g_state.consecutive_sensor_errors++;
+  }
+  if (g_state.consecutive_sensor_errors < kSensorFailureThreshold) {
+    return;
+  }
+
+  g_state.sensor_fault_active = true;
+  g_state.last_torque_command = 0.0f;
+  driver.disable();
+
+  const bool cooldown_elapsed =
+    !g_sensor_recovery_attempted ||
+    ((now_ms - g_last_sensor_recovery_ms) >= kSensorRecoveryCooldownMs); // Wrap-safe recovery rate limit.
+  if (cooldown_elapsed) {
+    restartI2cBus(now_ms);
+  }
+}
+
 // Initialize serial, persistent settings, sensor/driver/motor, and protocol state.
 void setup() {
   Serial.begin(kSerialBaud);
@@ -694,7 +806,6 @@ void setup() {
   Wire.begin(kI2cSdaPin, kI2cSclPin, kI2cClockHz);
   Wire.setClock(kI2cClockHz);
   Wire.setTimeOut(25);
-  sensor.min_elapsed_time = 2000; // 2000 microseconds ~ 500Hz update rate, which is sufficient for this application and reduces I2C bus load
   sensor.init(&Wire);
   motor.linkSensor(&sensor);
 
@@ -745,6 +856,8 @@ void loop() {
   const unsigned long now_ms = millis();
   const unsigned long now_us = micros();
 
+  serviceSensorHealth(now_ms);
+
   if (g_last_control_micros == 0) {
     g_last_control_micros = now_us;
   }
@@ -759,7 +872,9 @@ void loop() {
   const float alpha = (dt > 0.0f) ? clampValue<float>(dt / (tau + dt), 0.0f, 1.0f) : 1.0f;
   g_state.filtered_velocity_rad_s += alpha * (raw_velocity_rad_s - g_state.filtered_velocity_rad_s);
 
-  const float torque_command = computeCommandedTorque(logical_angle_rad, g_state.filtered_velocity_rad_s, now_ms);
+  const float torque_command = g_state.sensor_fault_active
+    ? 0.0f
+    : computeCommandedTorque(logical_angle_rad, g_state.filtered_velocity_rad_s, now_ms);
   g_state.last_torque_command = torque_command;
   motor.move(torque_command);
 

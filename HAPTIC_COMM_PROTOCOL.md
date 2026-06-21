@@ -300,7 +300,9 @@ Fields:
 - bit 4: vibration enabled
 - bit 5: dial is currently outside `[min, max]`
 - bit 6: fault active
-- bit 7 and above: reserved
+- bit 7: magnetic sensor fault active; torque output is disabled
+- bit 8: magnetic sensor recovery is active and valid reads are being confirmed
+- bit 9 and above: reserved
 
 If `status_bits` cannot be fully implemented during early bring-up, the field should still be present and may temporarily report `0`.
 
@@ -352,6 +354,7 @@ The firmware should not depend on game-stage-specific host knowledge. It only re
 - Unknown command letters: ignore them and treat them as a protocol fault.
 - Unknown `S` parameter names: ignore them and still acknowledge the `S` command.
 - Fault behavior: avoid uncontrolled torque output on encoder failure, driver fault, invalid control values, or impossible bounds such as `min > max`.
+- Sensor recovery: sustained magnetic-sensor I2C failures set bits 6 and 7, disable torque, and trigger a rate-limited bus restart. Bit 8 remains set until enough consecutive valid samples have been observed to restore torque.
 
 In a faulted state:
 
